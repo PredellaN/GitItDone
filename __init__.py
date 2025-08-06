@@ -1,84 +1,63 @@
-from subprocess import CompletedProcess
-from configparser import ConfigParser
-import os
-import subprocess
-import configparser
-import bpy #type: ignore
-from functools import lru_cache
-from . import auto_load
+from bpy.types import UILayout
+import bpy
+from . import registry
 
-auto_load.init()
+class GitOperator(bpy.types.Operator):
+    bl_idname: str = "wm.git_generic"
+    bl_label: str = "Generic Git"
 
-@lru_cache
-def get_repo(filepath) -> tuple[str | None, str | None]:
-    directory: str = os.path.dirname(filepath)
-    repo_path: str | None = None
-    while directory:
-        if os.path.isdir(os.path.join(directory, ".git")):
-            repo_path = directory
-            break
-        parent: str = os.path.dirname(directory)
-        if parent == directory:
-            break
-        directory = parent
+    def default_checks(self, filepath) -> set[str] | None:
+        from .instances.git_instance import git
+        if not git.repo:
+            self.report({'ERROR'}, "No Git repository found.")
+            return {'CANCELLED'}
+        return None
 
-    if repo_path:
-        config_path: str = os.path.join(repo_path, ".git", "config")
-        remote_url: str | None = None
-        if os.path.exists(path=config_path):
-            config: ConfigParser = configparser.ConfigParser()
-            config.read(filenames=config_path)
-            
-            section = 'remote "origin"'
-            if section in config and 'url' in config[section]:
-                remote_url = config[section]['url']
-        return repo_path, remote_url
-    else:
-        return None, None
+    def extra_checks(self, filepath) -> set[str] | None:
+        return None
 
-def has_tracked_changes(repo_path):
-    try:
-        result: CompletedProcess[str] = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=repo_path,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=True
-        )
-        return bool(result.stdout.strip())
-    except subprocess.CalledProcessError:
-        return False
+    def run_git(self, filepath) -> set[str] | None:
+        return None
+        
+    def execute(self, context): #type: ignore
+        filepath = bpy.data.filepath
 
-def check_for_conflicts(repo_path):
-    try:
-        result = subprocess.run(
-            ["git", "pull", "--dry-run"],
-            cwd=repo_path,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=True
-        )
-        # Look for conflict indicators in stdout or stderr
-        if "CONFLICT" in result.stdout or "error:" in result.stderr:
-            return True
-        return False
-    except subprocess.CalledProcessError:
-        return True
+        if ret := self.default_checks(filepath): return ret
+        if ret := self.extra_checks(filepath): return ret
+        if ret := self.run_git(filepath): return ret
 
-def commit_changes(repo_path, message):
-    try:
-        subprocess.run(["git", "add", "-A"], cwd=repo_path, check=True)
-        subprocess.run(["git", "commit", "-m", message], cwd=repo_path, check=True)
-        subprocess.run(["git", "push"], cwd=repo_path, check=True)
-        return True
-    except subprocess.CalledProcessError as e:
-        print("Git operation failed:", e)
-        return False
+@registry.register_class
+class GitPullOperator(GitOperator):
+    bl_idname: str = "wm.git_pull"
+    bl_label: str = "Git Pull"
 
-class CommitGitChangesOperator(bpy.types.Operator):
-    """Commit and sync changes if part of a Git repository."""
+    def run_git(self, filepath) -> set[str] | None:
+        from .instances.git_instance import git
+
+        if git.pull():
+            self.report({'INFO'}, "Changes pulled.")
+            return {'FINISHED'}
+        else:
+            self.report({'ERROR'}, "Git pull failed.")
+            return {'CANCELLED'}
+
+@registry.register_class
+class GitRevertOperator(GitOperator):
+    bl_idname: str = "wm.git_revert"
+    bl_label: str = "Git Revert"
+
+    def run_git(self, filepath) -> set[str] | None:
+        from .instances.git_instance import git
+        if git.revert_file(filepath):
+            self.report({'INFO'}, "Changes reverted.")
+            bpy.ops.wm.revert_mainfile()
+            return {'FINISHED'}
+        else:
+            self.report({'ERROR'}, "Git revert failed.")
+            return {'CANCELLED'}
+
+@registry.register_class
+class CommitGitChangesOperator(GitOperator):
     bl_idname: str = "wm.commit_git_changes"
     bl_label: str = "Commit Git Changes"
 
@@ -87,18 +66,21 @@ class CommitGitChangesOperator(bpy.types.Operator):
         default="Committing changes from Blender."
     )
 
-    def execute(self, context):
-        repo_path, url = get_repo(bpy.data.filepath)
+    def extra_checks(self, filepath):
+        from .instances.git_instance import git
 
-        if not has_tracked_changes(repo_path):
+        if not git.has_file_changes(filepath):
             self.report({'INFO'}, "No changes detected.")
             return {'CANCELLED'}
 
-        if check_for_conflicts(repo_path):
+        if git.will_conflict(filepath):
             self.report({'ERROR'}, "Potential merge conflicts detected. Resolve them before committing.")
             return {'CANCELLED'}
 
-        if commit_changes(repo_path, self.commit_message):
+    def run_git(self, filepath):
+        from .instances.git_instance import git
+
+        if git.commit_changes(self.commit_message, filepath):
             self.report({'INFO'}, "Changes committed and pushed successfully.")
             return {'FINISHED'}
         else:
@@ -107,40 +89,43 @@ class CommitGitChangesOperator(bpy.types.Operator):
 
     def invoke(self, context, event):
         wm = context.window_manager
-        return wm.invoke_props_dialog(self)
+        return wm.invoke_props_dialog(self) #type: ignore
 
+@registry.register_class
 class GIT_PT_tools_panel(bpy.types.Panel):
     """Panel to trigger Git commit operations."""
     bl_label: str = "Git Tools"
     bl_idname: str = "GIT_PT_tools_panel"
-    bl_space_type: str = 'PROPERTIES'
-    bl_region_type: str = 'WINDOW'
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
     bl_context: str = "scene"
 
     def draw(self, context):
-        layout = self.layout
+        from .instances.git_instance import git
+
+        layout: UILayout | None = self.layout
+        if not layout: return
+
         filepath = bpy.data.filepath
 
         if not filepath:
             layout.label(text="Please save the blend file first.")
             return
 
-        repo_path, url = get_repo(filepath)
+        url = git.remote_url
 
-        layout.label(text=f"Repository Path: {repo_path}")
+        layout.label(text=f"Repository Path: {git.repo_path}")
         layout.label(text=f"Repository URL: {url}")
-        if not repo_path:
+        if not git.repo:
             layout.label(text="The blend file is not part of a Git repository.")
             return
         
-        layout.operator("wm.commit_git_changes", text="Commit Git Changes")
+        layout.operator("wm.commit_git_changes", text="Commit Changes")
+        layout.operator("wm.git_revert", text="Revert Current File")
+        layout.operator("wm.git_pull", text="Pull Repository")
 
 def register():
-    auto_load.register()
-    bpy.utils.register_class(CommitGitChangesOperator)
-    bpy.utils.register_class(GIT_PT_tools_panel)
+    registry.blender_register_classes()
 
 def unregister():
-    bpy.utils.unregister_class(GIT_PT_tools_panel)
-    bpy.utils.unregister_class(CommitGitChangesOperator)
-    auto_load.unregister()
+    registry.blender_unregister_classes()
